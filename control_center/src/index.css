@@ -1,0 +1,64 @@
+:root {
+  --canvas: #efe7da;
+  --paper: #fffaf2;
+  --ink: #1a2730;
+  --text-strong: #f6efe3;
+  --text-muted: #72818a;
+  --text-muted-strong: #58707c;
+  --accent-soft: #9ed5cb;
+  --line: rgba(25, 35, 44, 0.12);
+  --font-display: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', serif;
+  --font-body: 'Avenir Next', 'Segoe UI', 'Helvetica Neue', sans-serif;
+
+  font-family: var(--font-body);
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 20% 0%, rgba(49, 122, 112, 0.16), transparent 30%),
+    radial-gradient(circle at 100% 20%, rgba(190, 126, 83, 0.14), transparent 24%),
+    linear-gradient(180deg, #f3ede4 0%, #efe7da 100%);
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+body,
+button,
+input,
+textarea,
+select {
+  font-family: var(--font-body);
+}
+
+p,
+li {
+  margin-top: 0;
+}
+
+button {
+  border: 0;
+}
+
+a {
+  color: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}

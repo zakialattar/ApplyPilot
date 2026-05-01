@@ -40,6 +40,15 @@ applypilot apply --dry-run  # fill forms without submitting
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
 
+## Control Center
+
+This fork also includes a local UI in [control_center](/Users/zaki/Documents/GitHub/job_apps/ApplyPilot/control_center).
+
+- macOS: double-click [launch_applypilot_ui.command](/Users/zaki/Documents/GitHub/job_apps/ApplyPilot/launch_applypilot_ui.command)
+- Windows: double-click [launch_applypilot_ui.bat](/Users/zaki/Documents/GitHub/job_apps/ApplyPilot/launch_applypilot_ui.bat)
+
+The launcher builds the UI, starts a local server on `http://127.0.0.1:8787`, and opens the browser.
+
 ---
 
 ## Two Paths
