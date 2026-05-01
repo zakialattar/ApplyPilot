@@ -1,7 +1,7 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn Codex sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + Codex for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -49,9 +50,9 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Track active Claude Code processes for skip (Ctrl+C) handling
-_claude_procs: dict[int, subprocess.Popen] = {}
-_claude_lock = threading.Lock()
+# Track active agent processes for skip (Ctrl+C) handling
+_agent_procs: dict[int, subprocess.Popen] = {}
+_agent_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
@@ -70,6 +71,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
             "playwright": {
                 "command": "npx",
                 "args": [
+                    "-y",
                     "@playwright/mcp@latest",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
@@ -81,6 +83,73 @@ def _make_mcp_config(cdp_port: int) -> dict:
             },
         }
     }
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def _prepare_codex_home(worker_id: int, worker_dir: Path, cdp_port: int) -> Path:
+    """Create a repo-local Codex home with per-worker MCP configuration."""
+    codex_root = config.APP_DIR / f"codex-home-{worker_id}"
+    codex_home = codex_root / ".codex"
+    codex_home.mkdir(parents=True, exist_ok=True)
+
+    source_auth = Path.home() / ".codex" / "auth.json"
+    if source_auth.exists():
+        shutil.copy2(source_auth, codex_home / "auth.json")
+
+    mcp_config_path = Path(os.environ["APPLYPILOT_MCP_CONFIG"]) if os.environ.get("APPLYPILOT_MCP_CONFIG") else None
+    if mcp_config_path and mcp_config_path.exists():
+        mcp_config = json.loads(mcp_config_path.read_text(encoding="utf-8"))
+    else:
+        mcp_config = _make_mcp_config(cdp_port)
+
+    lines = [
+        'personality = "pragmatic"',
+        "",
+        f"[projects.{_toml_string(str(worker_dir))}]",
+        'trust_level = "trusted"',
+        "",
+    ]
+
+    for name, server in mcp_config.get("mcpServers", {}).items():
+        lines.append(f"[mcp_servers.{name}]")
+        lines.append(f"command = {_toml_string(server['command'])}")
+        args = server.get("args", [])
+        lines.append(f"args = [{', '.join(_toml_string(arg) for arg in args)}]")
+        lines.append("")
+
+    (codex_home / "config.toml").write_text("\n".join(lines), encoding="utf-8")
+    return codex_root
+
+
+def build_codex_exec_command(
+    model: str,
+    worker_id: int,
+    cdp_port: int,
+    worker_dir: Path,
+) -> tuple[list[str], dict[str, str]]:
+    """Build the Codex CLI command and environment for one worker."""
+    codex_root = _prepare_codex_home(worker_id, worker_dir=worker_dir, cdp_port=cdp_port)
+
+    cmd = [
+        "codex",
+        "exec",
+        "--json",
+        "-C",
+        str(worker_dir),
+        "--skip-git-repo-check",
+        "-s",
+        "danger-full-access",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m",
+        model,
+    ]
+
+    env = os.environ.copy()
+    env["HOME"] = str(codex_root)
+    return cmd, env
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +280,8 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+               model: str = "gpt-5.4", worker_id: int = 0) -> Path | None:
+    """Generate a prompt file for manual Codex debugging.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -295,8 +364,8 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str = "gpt-5.4", dry_run: bool = False) -> tuple[str, int]:
+    """Spawn a Codex session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
@@ -317,37 +386,15 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         dry_run=dry_run,
     )
 
-    # Write per-worker MCP config
-    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
-
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
     worker_dir = reset_worker_dir(worker_id)
+    prompt_file = worker_dir / "apply-prompt.txt"
+    prompt_file.write_text(agent_prompt, encoding="utf-8")
+    cmd, env = build_codex_exec_command(
+        model=model,
+        worker_id=worker_id,
+        cdp_port=port,
+        worker_dir=worker_dir,
+    )
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
@@ -380,8 +427,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             env=env,
             cwd=str(worker_dir),
         )
-        with _claude_lock:
-            _claude_procs[worker_id] = proc
+        with _agent_lock:
+            _agent_procs[worker_id] = proc
 
         proc.stdin.write(agent_prompt)
         proc.stdin.close()
@@ -397,46 +444,38 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 try:
                     msg = json.loads(line)
                     msg_type = msg.get("type")
-                    if msg_type == "assistant":
-                        for block in msg.get("message", {}).get("content", []):
-                            bt = block.get("type")
-                            if bt == "text":
-                                text_parts.append(block["text"])
-                                lf.write(block["text"] + "\n")
-                            elif bt == "tool_use":
-                                name = (
-                                    block.get("name", "")
-                                    .replace("mcp__playwright__", "")
-                                    .replace("mcp__gmail__", "gmail:")
-                                )
-                                inp = block.get("input", {})
-                                if "url" in inp:
-                                    desc = f"{name} {inp['url'][:60]}"
-                                elif "ref" in inp:
-                                    desc = f"{name} {inp.get('element', inp.get('text', ''))}"[:50]
-                                elif "fields" in inp:
-                                    desc = f"{name} ({len(inp['fields'])} fields)"
-                                elif "paths" in inp:
-                                    desc = f"{name} upload"
-                                else:
-                                    desc = name
-
-                                lf.write(f"  >> {desc}\n")
-                                ws = get_state(worker_id)
-                                cur_actions = ws.actions if ws else 0
-                                update_state(worker_id,
-                                             actions=cur_actions + 1,
-                                             last_action=desc[:35])
-                    elif msg_type == "result":
+                    if msg_type == "item.completed":
+                        item = msg.get("item", {})
+                        item_type = item.get("type", "")
+                        if item_type == "agent_message":
+                            text = item.get("text", "")
+                            if text:
+                                text_parts.append(text)
+                                lf.write(text + "\n")
+                        elif item_type:
+                            desc = item.get("name") or item.get("title") or item_type
+                            lf.write(f"  >> {desc}\n")
+                            ws = get_state(worker_id)
+                            cur_actions = ws.actions if ws else 0
+                            update_state(
+                                worker_id,
+                                actions=cur_actions + 1,
+                                last_action=str(desc)[:35],
+                            )
+                    elif msg_type == "turn.completed":
                         stats = {
                             "input_tokens": msg.get("usage", {}).get("input_tokens", 0),
                             "output_tokens": msg.get("usage", {}).get("output_tokens", 0),
-                            "cache_read": msg.get("usage", {}).get("cache_read_input_tokens", 0),
-                            "cache_create": msg.get("usage", {}).get("cache_creation_input_tokens", 0),
-                            "cost_usd": msg.get("total_cost_usd", 0),
-                            "turns": msg.get("num_turns", 0),
+                            "cache_read": msg.get("usage", {}).get("cached_input_tokens", 0),
+                            "cache_create": 0,
+                            "cost_usd": 0,
+                            "turns": 1,
                         }
-                        text_parts.append(msg.get("result", ""))
+                    elif msg_type in {"error", "turn.failed"}:
+                        err = msg.get("message") or msg.get("error", {}).get("message", "")
+                        if err:
+                            text_parts.append(err)
+                            lf.write(err + "\n")
                 except json.JSONDecodeError:
                     text_parts.append(line)
                     lf.write(line + "\n")
@@ -453,7 +492,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"codex_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
@@ -509,8 +548,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
         return f"failed:{str(e)[:100]}", duration_ms
     finally:
-        with _claude_lock:
-            _claude_procs.pop(worker_id, None)
+        with _agent_lock:
+            _agent_procs.pop(worker_id, None)
         if proc is not None and proc.poll() is None:
             _kill_process_tree(proc.pid)
 
@@ -548,7 +587,7 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "gpt-5.4", dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -557,7 +596,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Codex model name.
         dry_run: Don't click Submit.
 
     Returns:
@@ -651,7 +690,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = False, model: str = "gpt-5.4",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.
@@ -661,7 +700,7 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Codex model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
@@ -697,16 +736,16 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            # Kill all active agent processes to skip current jobs
+            with _agent_lock:
+                for wid, cproc in list(_agent_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
         else:
             console.print("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
-            with _claude_lock:
-                for wid, cproc in list(_claude_procs.items()):
+            with _agent_lock:
+                for wid, cproc in list(_agent_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
             kill_all_chrome()

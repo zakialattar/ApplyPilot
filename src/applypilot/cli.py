@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 from typing import Optional
 
 import typer
@@ -147,7 +149,7 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("gpt-5.4", "--model", "-m", help="Codex model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -164,7 +166,7 @@ def apply(
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    # --- Utility modes (no Chrome/Codex needed) ---
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
@@ -186,7 +188,7 @@ def apply(
 
     # --- Full apply mode ---
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (Codex CLI + Chrome)
     check_tier(3, "auto-apply")
 
     # Check 2: Profile exists
@@ -211,7 +213,7 @@ def apply(
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT, _make_mcp_config
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -221,12 +223,13 @@ def apply(
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
+        mcp_path.write_text(json.dumps(_make_mcp_config(BASE_CDP_PORT)), encoding="utf-8")
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
         console.print(f"\n[bold]Run manually:[/bold]")
         console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
+            f"  APPLYPILOT_MCP_CONFIG={mcp_path} "
+            f"applypilot-codex-runner --model {model} --worker-id 0 --cdp-port {BASE_CDP_PORT} "
+            f"--prompt-file {prompt_file}"
         )
         return
 
@@ -335,10 +338,9 @@ def dashboard() -> None:
 @app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
-    import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, get_codex_login_status,
     )
 
     load_env()
@@ -383,26 +385,34 @@ def doctor() -> None:
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
+    codex_ready, codex_detail = get_codex_login_status()
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
-        results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
+        results.append(("AI text engine", ok_mark, f"Gemini ({model})"))
     elif has_openai:
         model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        results.append(("LLM API key", ok_mark, f"OpenAI ({model})"))
+        results.append(("AI text engine", ok_mark, f"OpenAI ({model})"))
     elif has_local:
-        results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+        results.append(("AI text engine", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
+    elif codex_ready:
+        model = os.environ.get("APPLYPILOT_CODEX_MODEL", "gpt-5.4")
+        results.append(("AI text engine", ok_mark, f"Codex ({model})"))
     else:
-        results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+        results.append(("AI text engine", fail_mark,
+                        "Run 'codex login' or set GEMINI_API_KEY / OPENAI_API_KEY / LLM_URL in ~/.applypilot/.env"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        results.append(("Claude Code CLI", ok_mark, claude_bin))
+    # Codex CLI
+    codex_bin = shutil.which("codex")
+    if codex_bin:
+        results.append(("Codex CLI", ok_mark, codex_bin))
+        if codex_ready:
+            results.append(("Codex login", ok_mark, codex_detail))
+        else:
+            results.append(("Codex login", fail_mark, codex_detail or "Run 'codex login'"))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Codex CLI", fail_mark,
+                        "Install with npm install -g @openai/codex, then run 'codex login'"))
 
     # Chrome
     try:
@@ -446,9 +456,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Codex CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Codex CLI + Chrome + Node.js)[/dim]")
 
     console.print()
 

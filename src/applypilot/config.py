@@ -3,6 +3,7 @@
 import os
 import platform
 import shutil
+import subprocess
 from pathlib import Path
 
 # User data directory — all user-specific files live here
@@ -68,6 +69,17 @@ def get_chrome_path() -> str:
         found = shutil.which(name)
         if found:
             return found
+
+    # Fall back to the Playwright-managed Chromium installed during bootstrap.
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            bundled_path = Path(playwright.chromium.executable_path)
+        if bundled_path.exists():
+            return str(bundled_path)
+    except Exception:
+        pass
 
     raise FileNotFoundError(
         "Chrome/Chromium not found. Install Chrome or set CHROME_PATH environment variable."
@@ -180,6 +192,32 @@ def load_env():
     load_dotenv()
 
 
+def get_codex_login_status() -> tuple[bool, str]:
+    """Return whether Codex CLI is installed and authenticated."""
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        return False, "Codex CLI not found."
+
+    try:
+        proc = subprocess.run(
+            ["codex", "login", "status"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return False, str(exc)
+
+    detail = proc.stdout.strip() or proc.stderr.strip()
+    if proc.returncode == 0:
+        return True, detail or codex_path
+
+    return False, detail or "Run `codex login`."
+
+
 # ---------------------------------------------------------------------------
 # Tier system — feature gating by installed dependencies
 # ---------------------------------------------------------------------------
@@ -200,24 +238,24 @@ TIER_COMMANDS: dict[int, list[str]] = {
 def get_tier() -> int:
     """Detect the current tier based on available dependencies.
 
-    Tier 1 (Discovery):            Python + pip
-    Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 1 (Discovery):              Python + pip
+    Tier 2 (AI Scoring & Tailoring): + API/local LLM or logged-in Codex
+    Tier 3 (Full Auto-Apply):        + logged-in Codex + Chrome/Chromium
     """
     load_env()
 
     has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
-    if not has_llm:
+    has_codex, _ = get_codex_login_status()
+    if not (has_llm or has_codex):
         return 1
 
-    has_claude = shutil.which("claude") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_codex and has_chrome:
         return 3
 
     return 2
@@ -237,12 +275,23 @@ def check_tier(required: int, feature: str) -> None:
     from rich.console import Console
     _console = Console(stderr=True)
 
+    codex_ready, codex_detail = get_codex_login_status()
+
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    if required >= 2 and not (
+        any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+        or codex_ready
+    ):
+        if shutil.which("codex"):
+            missing.append(f"Codex login — {codex_detail}")
+        else:
+            missing.append("Text generation engine — install Codex CLI or set GEMINI_API_KEY / OPENAI_API_KEY / LLM_URL")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if not codex_ready:
+            if shutil.which("codex"):
+                missing.append(f"Codex login — {codex_detail}")
+            else:
+                missing.append("Codex CLI — install with [bold]npm install -g @openai/codex[/bold], then run [bold]codex login[/bold]")
         try:
             get_chrome_path()
         except FileNotFoundError:

@@ -234,45 +234,20 @@ def _setup_searches() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_ai_features() -> None:
-    """Ask about AI scoring/tailoring — optional LLM configuration."""
+    """Configure Codex-backed scoring/tailoring defaults."""
     console.print(Panel(
-        "[bold]Step 4: AI Features (optional)[/bold]\n"
-        "An LLM powers job scoring, resume tailoring, and cover letters.\n"
-        "Without this, you can still discover and enrich jobs."
+        "[bold]Step 4: AI Features[/bold]\n"
+        "Codex powers job scoring, resume tailoring, and cover letters by default.\n"
+        "No separate Gemini or OpenAI API key is required."
     ))
 
-    if not Confirm.ask("Enable AI scoring and resume tailoring?", default=True):
-        console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
-        return
-
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
-    provider = Prompt.ask(
-        "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
-    )
-
     env_lines = ["# ApplyPilot configuration", ""]
-
-    if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
-        model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
+    model = Prompt.ask("Codex model", default="gpt-5.4")
+    env_lines.append(f"APPLYPILOT_CODEX_MODEL={model}")
 
     env_lines.append("")
     ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
-    console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
+    console.print(f"[green]Codex configuration saved to {ENV_PATH}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -280,25 +255,26 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires Codex CLI)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using Codex as the browser agent."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
-        console.print("[green]Claude Code CLI detected.[/green]")
+    # Check for Codex CLI
+    if shutil.which("codex"):
+        console.print("[green]Codex CLI detected.[/green]")
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]Codex CLI not found on PATH.[/yellow]\n"
+            "Install it with: [bold]npm install -g @openai/codex[/bold]\n"
+            "Then authenticate with: [bold]codex login[/bold]\n"
+            "Auto-apply won't work until Codex is installed."
         )
 
     # Optional: CapSolver for CAPTCHAs
@@ -356,7 +332,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (Codex detection)
     _setup_auto_apply()
     console.print()
 
@@ -380,7 +356,7 @@ def run_wizard() -> None:
     if tier == 1:
         unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install Codex CLI + Chrome.[/dim]"
 
     console.print(
         Panel.fit(

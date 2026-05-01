@@ -8,7 +8,10 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import json
 import sqlite3
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -18,6 +21,9 @@ from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
 
 log = logging.getLogger(__name__)
+
+DEFAULT_SITES = ["indeed", "linkedin"]
+SITE_TIMEOUT_SECONDS = 120
 
 
 # -- Proxy parsing -----------------------------------------------------------
@@ -72,6 +78,50 @@ def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0)
                 time.sleep(wait)
             else:
                 raise
+
+
+def _scrape_site_with_timeout(
+    kwargs: dict,
+    site_name: str,
+    max_retries: int,
+    timeout_seconds: int = SITE_TIMEOUT_SECONDS,
+):
+    """Run one site scrape in a separate Python process with a hard timeout."""
+    helper = f"""
+import json
+import sys
+from applypilot.discovery.jobspy import _scrape_with_retry
+
+kwargs = json.loads(sys.stdin.read())
+df = _scrape_with_retry(kwargs, max_retries={max_retries})
+print(df.to_json(orient="records"))
+"""
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", helper],
+            input=json.dumps(kwargs),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError(f"{site_name} timed out after {timeout_seconds}s")
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"{site_name} failed: {detail[:500]}")
+
+    payload = proc.stdout.strip()
+    if not payload:
+        import pandas as pd
+        return pd.DataFrame()
+
+    import pandas as pd
+    return pd.DataFrame(json.loads(payload))
 
 
 # -- Location filtering ------------------------------------------------------
@@ -202,19 +252,19 @@ def _run_one_search(
     if "tier" in s:
         label += f" [tier {s['tier']}]"
 
-    # Split sites: Glassdoor needs simplified location, others use original
-    gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
-    has_glassdoor = "glassdoor" in sites
-    other_sites = [si for si in sites if si != "glassdoor"]
-
     all_dfs = []
 
-    # Run non-Glassdoor sites with original location
-    if other_sites:
+    for site in sites:
+        site_location = (
+            glassdoor_map.get(s["location"], s["location"].split(",")[0])
+            if site == "glassdoor"
+            else s["location"]
+        )
+        site_label = "ZipRecruiter" if site == "zip_recruiter" else site.replace("_", " ").title()
         kwargs = {
-            "site_name": other_sites,
+            "site_name": [site],
             "search_term": s["query"],
-            "location": s["location"],
+            "location": site_location,
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
@@ -225,34 +275,23 @@ def _run_one_search(
             kwargs["is_remote"] = True
         if proxy_config:
             kwargs["proxies"] = [proxy_config["jobspy"]]
-        if "linkedin" in other_sites:
+        if site == "linkedin":
             kwargs["linkedin_fetch_description"] = True
+
+        started = time.time()
+        log.info("[%s] starting %s", label, site_label)
         try:
-            df = _scrape_with_retry(kwargs, max_retries=max_retries)
+            df = _scrape_site_with_timeout(kwargs, site_label, max_retries=max_retries)
+            log.info(
+                "[%s] finished %s in %.1fs (%d results)",
+                label,
+                site_label,
+                time.time() - started,
+                len(df),
+            )
             all_dfs.append(df)
         except Exception as e:
-            log.error("[%s] (non-gd): %s", label, e)
-
-    # Run Glassdoor separately with simplified location
-    if has_glassdoor:
-        gd_kwargs = {
-            "site_name": ["glassdoor"],
-            "search_term": s["query"],
-            "location": gd_location,
-            "results_wanted": results_per_site,
-            "hours_old": hours_old,
-            "description_format": "markdown",
-            "verbose": 0,
-        }
-        if s.get("remote"):
-            gd_kwargs["is_remote"] = True
-        if proxy_config:
-            gd_kwargs["proxies"] = [proxy_config["jobspy"]]
-        try:
-            gd_df = _scrape_with_retry(gd_kwargs, max_retries=max_retries)
-            all_dfs.append(gd_df)
-        except Exception as e:
-            log.error("[%s] (glassdoor): %s", label, e)
+            log.error("[%s] (%s): %s", label, site, e)
 
     if not all_dfs:
         log.error("[%s]: all sites failed", label)
@@ -301,7 +340,7 @@ def search_jobs(
 ) -> dict:
     """Run a single job search via JobSpy and store results in DB."""
     if sites is None:
-        sites = ["indeed", "linkedin", "zip_recruiter"]
+        sites = list(DEFAULT_SITES)
 
     proxy_config = parse_proxy(proxy) if proxy else None
 
@@ -369,7 +408,7 @@ def _full_crawl(
 ) -> dict:
     """Run all search queries from search config across all locations."""
     if sites is None:
-        sites = ["indeed", "linkedin", "zip_recruiter"]
+        sites = list(DEFAULT_SITES)
 
     # Build search combinations from config
     queries = search_cfg.get("queries", [])

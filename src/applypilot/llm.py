@@ -2,20 +2,28 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
-  OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
+  GEMINI_API_KEY         -> Google Gemini (default: gemini-2.0-flash)
+  OPENAI_API_KEY         -> OpenAI (default: gpt-4o-mini)
+  LLM_URL                -> Local llama.cpp / Ollama compatible endpoint
+  logged-in codex CLI    -> Codex fallback (default: gpt-5.4)
 
-LLM_MODEL env var overrides the model name for any provider.
+LLM_MODEL overrides API/local providers.
+APPLYPILOT_CODEX_MODEL overrides the Codex model.
 """
 
+import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+_CODEX_PROVIDER = "codex-cli"
+_DEFAULT_CODEX_MODEL = "gpt-5.4"
 
 # ---------------------------------------------------------------------------
 # Provider detection
@@ -53,9 +61,19 @@ def _detect_provider() -> tuple[str, str, str]:
             os.environ.get("LLM_API_KEY", ""),
         )
 
+    from applypilot.config import get_codex_login_status
+
+    codex_ready, _ = get_codex_login_status()
+    if codex_ready:
+        return (
+            _CODEX_PROVIDER,
+            os.environ.get("APPLYPILOT_CODEX_MODEL", "") or _DEFAULT_CODEX_MODEL,
+            "",
+        )
+
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Install Codex CLI or set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 
@@ -88,10 +106,86 @@ class LLMClient:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
+        self._client = httpx.Client(timeout=_TIMEOUT) if base_url != _CODEX_PROVIDER else None
         # True once we've confirmed the native Gemini API works for this model
         self._use_native_gemini: bool = False
         self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
+        self._is_codex = base_url == _CODEX_PROVIDER
+
+    # -- Codex CLI ---------------------------------------------------------
+
+    def _chat_codex(self, messages: list[dict], max_tokens: int) -> str:
+        """Use the local Codex CLI as a text-generation fallback."""
+        prompt_parts = [
+            "You are the text generation engine for ApplyPilot.",
+            "Follow the provided instructions exactly.",
+            "Return only the requested output with no extra commentary.",
+        ]
+
+        for msg in messages:
+            role = msg.get("role", "user").upper()
+            prompt_parts.append(f"{role}:\n{msg.get('content', '')}")
+
+        prompt = "\n\n".join(prompt_parts)
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "-C",
+            os.getcwd(),
+            "-s",
+            "danger-full-access",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-m",
+            self.model,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_TIMEOUT,
+            check=False,
+        )
+
+        outputs: list[str] = []
+        errors: list[str] = []
+
+        for raw_line in proc.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            item_type = item.get("type")
+            if item_type == "item.completed":
+                payload = item.get("item", {})
+                if payload.get("type") == "agent_message" and payload.get("text"):
+                    outputs.append(payload["text"])
+            elif item_type in {"error", "turn.failed"}:
+                message = item.get("message") or item.get("error", {}).get("message", "")
+                if message:
+                    errors.append(message)
+
+        if proc.returncode != 0:
+            detail = "\n".join(errors) or proc.stderr.strip() or proc.stdout.strip()
+            raise RuntimeError(f"Codex CLI failed (exit {proc.returncode}): {detail[:500]}")
+
+        response_text = "\n".join(part for part in outputs if part).strip()
+        if response_text:
+            return response_text
+
+        if errors:
+            raise RuntimeError(f"Codex CLI produced no answer: {' | '.join(errors)[:500]}")
+
+        raise RuntimeError("Codex CLI produced no answer.")
 
     # -- Native Gemini API --------------------------------------------------
 
@@ -201,6 +295,9 @@ class LLMClient:
 
         for attempt in range(_MAX_RETRIES):
             try:
+                if self._is_codex:
+                    return self._chat_codex(messages, max_tokens)
+
                 # Route to native Gemini if we've already confirmed it's needed
                 if self._use_native_gemini:
                     return self._chat_native_gemini(messages, temperature, max_tokens)
@@ -270,7 +367,8 @@ class LLMClient:
         return self.chat([{"role": "user", "content": prompt}], **kwargs)
 
     def close(self) -> None:
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
 
 class _GeminiCompatForbidden(Exception):

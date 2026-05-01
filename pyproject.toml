@@ -33,6 +33,7 @@ dev = ["pytest>=7.0", "ruff>=0.1"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
+applypilot-codex-runner = "applypilot.apply.codex_runner:main"
 
 [project.urls]
 Homepage = "https://github.com/Pickle-Pixel/ApplyPilot"
